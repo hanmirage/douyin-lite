@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-dy-ingest"
+description = "Enables the dy_ingest command without any pre-configured scope."
+commands.allow = ["dy_ingest"]
+
+[[permission]]
+identifier = "deny-dy-ingest"
+description = "Denies the dy_ingest command without any pre-configured scope."
+commands.deny = ["dy_ingest"]

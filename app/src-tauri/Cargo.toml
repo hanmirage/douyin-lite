@@ -1,0 +1,27 @@
+[package]
+name = "douyin-lite"
+version = "0.1.0"
+description = "轻量抖音桌面端（WebView + 注入脚本）"
+authors = ["you"]
+edition = "2021"
+
+[lib]
+name = "douyin_lite_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["native-tls", "stream"] }
+futures-util = "0.3"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+panic = "abort"
+strip = true

@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-dy-set-titlebar"
+description = "Enables the dy_set_titlebar command without any pre-configured scope."
+commands.allow = ["dy_set_titlebar"]
+
+[[permission]]
+identifier = "deny-dy-set-titlebar"
+description = "Denies the dy_set_titlebar command without any pre-configured scope."
+commands.deny = ["dy_set_titlebar"]
