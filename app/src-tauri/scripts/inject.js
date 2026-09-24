@@ -12,7 +12,10 @@
   S.booted = true;
   S.ua = navigator.userAgent;
   S.seen = new Map();
-  S.dirty = false;
+  // 只装「上次上报之后新增或补全」的条目，避免每轮把全量重发给 Rust。
+  S.outbox = new Map();
+  // JS 侧只做窗口，真正的下载凭据在 Rust 的 store 里，所以这里可以淘汰最旧的。
+  S.cap = 400;
 
   const HIDE_KEY = "dylite:hidden";
   const ok = (v) => typeof v === "string" && v;
@@ -55,7 +58,9 @@
       el.id = "dylite-style";
       root.appendChild(el);
     }
-    el.textContent = BASE_CSS + "\n" + userCss();
+    const css = BASE_CSS + "\n" + userCss();
+    // 重写 textContent 会让整页样式失效重算，内容没变就别动
+    if (el.textContent !== css) el.textContent = css;
   }
 
   applyCss();
@@ -103,8 +108,11 @@
         urls,
       };
       const known = S.seen.get(entry.id);
-      if (!known || (known.urls.length === 0 && entry.urls.length)) S.seen.set(entry.id, entry);
-      S.dirty = true;
+      if (!known || (known.urls.length === 0 && entry.urls.length)) {
+        S.seen.set(entry.id, entry);
+        S.outbox.set(entry.id, entry);
+        if (S.seen.size > S.cap) S.seen.delete(S.seen.keys().next().value);
+      }
     }
     for (const key in node) {
       if (key === "children" || key === "_owner") continue;
@@ -122,7 +130,7 @@
     } catch (err) {
       console.debug("[dylite] harvest", err);
     }
-    if (S.dirty) flush();
+    if (S.outbox.size) flush();
   }
 
   const nativeFetch = window.fetch;
@@ -174,11 +182,16 @@
 
   function push() {
     const tauri = window.__TAURI__;
-    if (!tauri || !tauri.core || !S.dirty) return;
-    S.dirty = false;
+    const batch = [...S.outbox.values()];
+    if (!batch.length || !tauri || !tauri.core) return;
+    S.outbox.clear();
     tauri.core
-      .invoke("dy_ingest", { items: [...S.seen.values()], ua: S.ua })
-      .catch((e) => console.debug("[dylite] ingest 失败", e));
+      .invoke("dy_ingest", { items: batch, ua: S.ua })
+      .catch((e) => {
+        // 报不进去就退回去，下一轮再试；丢了 Rust 侧就没有这条的取流地址
+        console.debug("[dylite] ingest 失败", e);
+        for (const it of batch) S.outbox.set(it.id, it);
+      });
   }
 
   async function invoke(cmd, args) {
@@ -208,11 +221,7 @@
   async function download() {
     const id = currentId();
     if (!id) return toast("没识别到当前视频（页面结构变了？），悬停在画面上再按 D");
-    const info = S.seen.get(id);
-    if (!info || !info.urls.length) {
-      push();
-      return toast(`视频 ${id} 的取流地址还没旁听到，等它播起来再按一次 D`);
-    }
+    // 不在本地缓存里也照样问一次 Rust：JS 侧会淘汰旧的，Rust 侧才是下载的凭据。
     toast("开始下载…", 1600);
     try {
       const path = await invoke("dy_download", { id });
@@ -260,7 +269,7 @@
     if (!el) return toast("这个页面没有弹幕层");
     if (el.dataset.dylShow === "1") delete el.dataset.dylShow;
     else el.dataset.dylShow = "1";
-    applyCss();
+    // 规则是静态的 `:not([data-dyl-show])`，改 dataset 就够了，不必重写整张样式表
     toast(el.dataset.dylShow === "1" ? "显示弹幕" : "隐藏弹幕");
   }
 
@@ -297,7 +306,6 @@
     } else {
       delete document.documentElement.dataset.dylPick;
       document.removeEventListener("click", grab, true);
-      applyCss();
       toast(`已隐藏 ${rules.length} 处${rules.length ? "（Alt+Z 全部撤销）" : ""}`);
     }
   }
@@ -473,17 +481,9 @@
     window.__TAURI__.event.listen("dy:downloaded", (e) => toast("下载完成 " + e.payload, 7000)).catch(() => {});
   }
 
-  // 页面自身的导航会换掉 DOM，切页时重新对齐弹幕开关并补报一次
-  document.addEventListener("visibilitychange", () => {
-    if (!document.hidden) {
-      applyCss();
-      S.dirty = true;
-      flush();
-    }
-  });
-
+  // 有积压就补报一次：抖有的页面导航会把请求节奏打断，靠这个兜住
   setInterval(() => {
-    if (S.seen.size && (S.dirty || S.seen.size % 12 === 0)) flush();
+    if (S.outbox.size) flush();
   }, 4000);
 
   toast("抖音 Lite 已接管：? 看快捷键", 2200);

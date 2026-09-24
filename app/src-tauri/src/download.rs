@@ -2,13 +2,13 @@ use std::collections::HashMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use futures_util::StreamExt;
 use serde::Deserialize;
-use tauri::path::BaseDirectory;
-use tauri::{AppHandle, Emitter, Manager, State};
+use tauri::{AppHandle, Emitter, State};
 
 /// 注入脚本从 feed 响应里旁听到的视频信息。
 #[derive(Deserialize, Clone, Debug)]
@@ -21,12 +21,44 @@ pub struct MediaItem {
     pub author: String,
     #[serde(default)]
     pub urls: Vec<String>,
+    /// 入库序号，只用于淘汰，不接收前端传值
+    #[serde(skip_deserializing)]
+    pub seq: u64,
 }
+
+/// 旁听窗口大小。超出后按 seq 淘汰最旧的，不再整表清空——
+/// 清空会连你正在看那条的取流地址一起丢掉。
+const MAX_ITEMS: usize = 800;
 
 #[derive(Default)]
 pub struct Store {
     items: Mutex<HashMap<String, MediaItem>>,
+    next_seq: AtomicU64,
     user_agent: Mutex<String>,
+}
+
+/// 按 id 合并一批旁听结果，并在超出窗口时淘汰最旧的。
+fn ingest(store: &mut HashMap<String, MediaItem>, items: Vec<MediaItem>, next_seq: &AtomicU64) {
+    for mut item in items.into_iter().filter(|i| is_valid_id(&i.id)) {
+        item.seq = next_seq.fetch_add(1, Ordering::Relaxed);
+        let keep_known_urls = store
+            .get(&item.id)
+            .is_some_and(|known| !known.urls.is_empty() && item.urls.is_empty());
+        if keep_known_urls {
+            if let Some(known) = store.get_mut(&item.id) {
+                known.seq = item.seq;
+            }
+        } else {
+            store.insert(item.id.clone(), item);
+        }
+    }
+    if store.len() > MAX_ITEMS {
+        let mut by_seq: Vec<(u64, String)> = store.iter().map(|(k, v)| (v.seq, k.clone())).collect();
+        by_seq.sort();
+        for (_, id) in by_seq.into_iter().take(store.len() - MAX_ITEMS) {
+            store.remove(&id);
+        }
+    }
 }
 
 /// 远程页面可以调用本模块的命令，所以取流地址必须落在已知 CDN 域名内，
@@ -120,19 +152,7 @@ pub fn dy_ingest(
         *state.user_agent.lock().map_err(|_| "内部状态不可用")? = ua;
     }
     let mut store = state.items.lock().map_err(|_| "内部状态不可用")?;
-    if store.len() > 800 {
-        store.clear();
-    }
-    for item in items.into_iter().filter(|i| is_valid_id(&i.id)) {
-        store
-            .entry(item.id.clone())
-            .and_modify(|known| {
-                if known.urls.is_empty() {
-                    known.urls = item.urls.clone();
-                }
-            })
-            .or_insert(item);
-    }
+    ingest(&mut store, items, &state.next_seq);
     Ok(store.len())
 }
 
@@ -161,10 +181,7 @@ pub async fn dy_download(app: AppHandle, state: State<'_, Store>, id: String) ->
             }
         })?;
 
-    let dir = app
-        .path()
-        .resolve("", BaseDirectory::Download)
-        .map_err(|e| e.to_string())?;
+    let dir = crate::paths::download_dir()?;
     let ua = {
         let guard = state.user_agent.lock().map_err(|_| "内部状态不可用")?;
         if guard.is_empty() {
@@ -217,4 +234,145 @@ pub async fn dy_download(app: AppHandle, state: State<'_, Store>, id: String) ->
     let path = target.display().to_string();
     let _ = app.emit("dy:downloaded", path.clone());
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(id: &str, desc: &str, urls: &[&str]) -> MediaItem {
+        MediaItem {
+            id: id.to_string(),
+            desc: desc.to_string(),
+            author: String::new(),
+            urls: urls.iter().map(|s| s.to_string()).collect(),
+            seq: 0,
+        }
+    }
+
+    fn seq_counter() -> AtomicU64 {
+        AtomicU64::new(1)
+    }
+
+    #[test]
+    fn whitelist_accepts_https_subdomains() {
+        assert!(url_allowed("https://v26-web.douyinvod.com/a.mp4"));
+        assert!(url_allowed("https://www.douyin.com/b.mp4"));
+        assert!(url_allowed("https://douyinvod.com/c.mp4"));
+    }
+
+    #[test]
+    fn whitelist_rejects_plain_http() {
+        assert!(!url_allowed("http://v26-web.douyinvod.com/a.mp4"));
+    }
+
+    /// 后缀拼接式的伪装域名：`ends_with(".{domain}")` 单独用不够，必须整体解析
+    #[test]
+    fn whitelist_rejects_lookalike_hosts() {
+        for u in [
+            "https://evil-douyinvod.com/a.mp4",
+            "https://douyinvod.com.evil.cn/a.mp4",
+            "https://v26-web.douyinvod.com.attacker.net/a.mp4",
+            "https://evil.com/?u=https://v26-web.douyinvod.com/a.mp4",
+        ] {
+            assert!(!url_allowed(u), "不该放行 {}", u);
+        }
+    }
+
+    #[test]
+    fn whitelist_rejects_unparsable() {
+        assert!(!url_allowed(""));
+        assert!(!url_allowed("blob:https://www.douyin.com/x"));
+        assert!(!url_allowed("javascript:alert(1)"));
+    }
+
+    #[test]
+    fn id_must_be_10_to_25_digits() {
+        assert!(is_valid_id("7688933322579299603"));
+        assert!(!is_valid_id(""));
+        assert!(!is_valid_id("123456789"));
+        assert!(!is_valid_id("768893332257929960a"));
+        assert!(!is_valid_id("76889333225792996031234567890"));
+    }
+
+    #[test]
+    fn filename_strips_windows_illegal_chars() {
+        let dirty = format!("a<b>:c/d{}|f?g*h{}i", '\\', '"');
+        let name = safe_filename(&item("1234567890", &dirty, &[]));
+        for c in ['<', '>', ':', '"', '/', '\\', '|', '?', '*'] {
+            assert!(!name.contains(c), "文件名里不该留着 {}: {}", c, name);
+        }
+        assert_eq!(name, "abcdfghi.mp4", "实际 {}", name);
+    }
+
+    #[test]
+    fn filename_falls_back_to_id_when_desc_empty() {
+        assert_eq!(safe_filename(&item("7688933322579299603", "   ", &[])), "douyin-7688933322579299603.mp4");
+    }
+
+    #[test]
+    fn filename_trims_trailing_dots() {
+        assert_eq!(safe_filename(&item("1234567890", "完了...", &[])), "完了.mp4");
+    }
+
+    #[test]
+    fn filename_caps_length_in_chars_not_bytes() {
+        let long = "中".repeat(200);
+        let name = safe_filename(&item("1234567890", &long, &[]));
+        assert_eq!(name.chars().count(), 94, "实际 {}", name.chars().count());
+        assert!(name.starts_with("中中中"));
+        assert!(name.ends_with(".mp4"));
+    }
+
+    #[test]
+    fn unique_path_appends_index_instead_of_overwriting() {
+        let dir = std::env::temp_dir().join(format!("dylite-ut-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("视频.mp4"), b"x").unwrap();
+        let p = unique_path(&dir, "视频.mp4");
+        assert_eq!(p.file_name().unwrap().to_string_lossy(), "视频 (2).mp4");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ingest_keeps_known_urls_when_new_batch_has_none() {
+        let mut store = HashMap::new();
+        let n = seq_counter();
+        ingest(&mut store, vec![item("7688933322579299603", "有地址", &["https://v26-web.douyinvod.com/a.mp4"])], &n);
+        ingest(&mut store, vec![item("7688933322579299603", "有地址", &[])], &n);
+        assert_eq!(store["7688933322579299603"].urls.len(), 1, "空批次不该把已抓到的地址抹掉");
+    }
+
+    #[test]
+    fn ingest_fills_urls_when_known_has_none() {
+        let mut store = HashMap::new();
+        let n = seq_counter();
+        ingest(&mut store, vec![item("7688933322579299603", "先到 id", &[])], &n);
+        ingest(&mut store, vec![item("7688933322579299603", "后到地址", &["https://v26-web.douyinvod.com/a.mp4"])], &n);
+        assert_eq!(store["7688933322579299603"].urls.len(), 1);
+        assert_eq!(store["7688933322579299603"].desc, "后到地址");
+    }
+
+    #[test]
+    fn ingest_ignores_invalid_ids() {
+        let mut store = HashMap::new();
+        let n = seq_counter();
+        ingest(&mut store, vec![item("not-an-id", "x", &["https://v26-web.douyinvod.com/a.mp4"])], &n);
+        assert!(store.is_empty());
+    }
+
+    /// 这条就是原来那个缺陷：溢出时整表清空，会把正在看那条的地址一起丢掉
+    #[test]
+    fn overflow_evicts_oldest_and_keeps_current() {
+        let mut store = HashMap::new();
+        let n = seq_counter();
+        for i in 0..MAX_ITEMS + 5 {
+            ingest(&mut store, vec![item(&format!("{:019}", i), "d", &["https://v26-web.douyinvod.com/a.mp4"])], &n);
+        }
+        assert_eq!(store.len(), MAX_ITEMS, "应停在窗口上限");
+        let newest = format!("{:019}", MAX_ITEMS + 4);
+        assert!(store.contains_key(&newest), "最后一条必须在");
+        assert!(!store.contains_key("0000000000000000000"), "最旧的应被淘汰");
+    }
 }
