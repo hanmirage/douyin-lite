@@ -15,6 +15,16 @@
 这也意味着：抖音的 class 名是构建哈希（`wiu7QUYe` 这种），所有选择器只依赖
 `data-e2e` / `data-e2e-vid` / `data-aweme-id` 这类语义属性。
 
+## 数据落在哪
+
+装在哪，资料就在哪 —— 一律相对 exe 所在目录，不往用户目录写：
+
+- `<exe 目录>\data\webview\EBWebView\`：WebView2 用户数据，登录态、LocalStorage 和抖音视频媒体缓存都在这里。
+  不重定向的话它默认落在 `%LOCALAPPDATA%\com.lite.douyin`，实测光缓存就能到 385 MB 且还在长。
+- `<exe 目录>\Downloads\`：按 `D` 下载的视频，以及你在页面上点出来的下载（另存视频、抖音自己的下载按钮）。
+
+两个目录启动时创建。把整个文件夹拷到别处，登录态跟着走。
+
 ## 快捷键
 
 | 键 | 作用 |
